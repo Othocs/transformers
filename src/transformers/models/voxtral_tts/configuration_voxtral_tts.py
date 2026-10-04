@@ -55,9 +55,13 @@ class VoxtralTtsCodecConfig(PreTrainedConfig):
     causal (`bool`, *optional*, defaults to `True`):
         Whether to use causal attention in the codec transformer.
     attn_sliding_window_size (`int`, *optional*, defaults to 16):
-        Sliding window size for the codec attention.
+        Sliding window size of the *first* codec attention block. The decoder doubles this window
+        after every upsampling convolution when `half_attn_window_upon_downsampling` is set, giving
+        the 2 -> 4 -> 8 -> 16 schedule that mirrors the encoder's 16 -> 8 -> 4 -> 2.
     half_attn_window_upon_downsampling (`bool`, *optional*, defaults to `True`):
-        Whether to halve the attention window upon downsampling.
+        Whether the attention window tracks the resampling factor across blocks.
+    use_biases (`bool`, *optional*, defaults to `False`):
+        Whether the codec attention output projection and MLP use biases.
     qk_norm (`bool`, *optional*, defaults to `True`):
         Whether to apply QK normalization.
     qk_norm_eps (`float`, *optional*, defaults to 1e-6):
@@ -104,6 +108,7 @@ class VoxtralTtsCodecConfig(PreTrainedConfig):
     causal: bool = True
     attn_sliding_window_size: int = 16
     half_attn_window_upon_downsampling: bool = True
+    use_biases: bool = False
     qk_norm: bool = True
     qk_norm_eps: float = 1e-6
     rms_norm_eps: float = 0.01
@@ -143,8 +148,10 @@ class VoxtralTtsFlowMatchingConfig(PreTrainedConfig):
         Number of key-value heads for grouped-query attention.
     head_dim (`int`, *optional*, defaults to 128):
         Dimension of each attention head.
-    rope_theta (`float`, *optional*, defaults to 10000.0):
-        Base frequency for RoPE embeddings.
+    time_embedding_theta (`float`, *optional*, defaults to 10000.0):
+        Base frequency of the sinusoidal timestep embedding. The flow-matching transformer applies
+        no rotary or learned positional embedding: its three inputs are conditioning signals, not a
+        sequence, so the only positional information is the encoded ODE timestep.
     sigma (`float`, *optional*, defaults to 1e-5):
         Minimum noise level for flow matching.
     sigma_max (`float`, *optional*, defaults to 1.0):
@@ -153,10 +160,6 @@ class VoxtralTtsFlowMatchingConfig(PreTrainedConfig):
         Number of acoustic codebooks (dimensionality of the acoustic input).
     semantic_vocab_size (`int`, *optional*, defaults to 8320):
         Size of the semantic codebook output head (8192 semantic codes + 128 special tokens).
-    attention_dropout (`float`, *optional*, defaults to 0.0):
-        Dropout probability for attention weights.
-    max_position_embeddings (`int`, *optional*, defaults to 128000):
-        Maximum sequence length for rotary position embeddings.
 
     Example:
 
@@ -176,17 +179,13 @@ class VoxtralTtsFlowMatchingConfig(PreTrainedConfig):
     num_attention_heads: int = 32
     num_key_value_heads: int = 8
     head_dim: int = 128
-    rope_theta: float = 10000.0
+    time_embedding_theta: float = 10000.0
     rms_norm_eps: float = 1e-5
     sigma: float = 1e-5
     sigma_max: float = 1.0
     acoustic_dim: int = 36
     semantic_vocab_size: int = 8320
     hidden_act: str = "silu"
-    attention_dropout: float = 0.0
-    max_position_embeddings: int = 128000
-    rope_parameters: RopeParameters | dict | None = None
-    sliding_window: int | None = None
     initializer_range: float = 0.02
 
     def __post_init__(self, **kwargs):
@@ -206,8 +205,6 @@ class VoxtralTtsConfig(PreTrainedConfig):
         Token ID used to represent audio placeholder tokens in the text input.
     begin_audio_token_id (`int`, *optional*, defaults to 25):
         Token ID marking the beginning of an audio segment.
-    condition_dropped_token_id (`int`, *optional*, defaults to 42):
-        Token ID used when conditioning is dropped (classifier-free guidance).
     num_codebooks (`int`, *optional*, defaults to 37):
         Total number of codebooks (1 semantic + 36 acoustic).
     semantic_codebook_size (`int`, *optional*, defaults to 8192):
@@ -217,8 +214,22 @@ class VoxtralTtsConfig(PreTrainedConfig):
     n_acoustic_codebook (`int`, *optional*, defaults to 36):
         Number of acoustic codebooks.
     audio_vocab_size (`int`, *optional*, defaults to 9088):
-        Total number of entries in the audio codebook embedding table. Covers 1 semantic codebook (8192 entries)
-        plus 36 acoustic codebooks (21 levels each, laid out with stride 25).
+        Number of rows in the shared audio codebook embedding table. Each codebook occupies a
+        contiguous block sized `codebook_size + num_special_audio_tokens`, so the blocks are
+        `8192 + 2` for the semantic codebook and `21 + 2` for each of the 36 acoustic ones
+        (9022 rows total), padded up to the next multiple of 128.
+    num_special_audio_tokens (`int`, *optional*, defaults to 2):
+        Number of audio special tokens reserved at the bottom of every codebook. Emitted codes are
+        offset by this amount, so acoustic level `l` is stored as `l + num_special_audio_tokens`.
+    empty_audio_token_id (`int`, *optional*, defaults to 0):
+        Id of the `[EMPTY_AUDIO]` token, used to blank acoustic codebooks once generation has ended.
+        It is never a valid prediction for the semantic codebook.
+    end_audio_token_id (`int`, *optional*, defaults to 1):
+        Id of the `[END_AUDIO]` token. The semantic codebook predicting it terminates generation.
+    num_flow_steps (`int`, *optional*, defaults to 8):
+        Number of Euler steps used by the flow-matching ODE solver at inference.
+    guidance_scale (`float`, *optional*, defaults to 1.2):
+        Default classifier-free guidance scale applied to the acoustic velocity field.
     sampling_rate (`int`, *optional*, defaults to 24000):
         Audio sampling rate in Hz.
     frame_rate (`float`, *optional*, defaults to 12.5):
@@ -278,12 +289,16 @@ class VoxtralTtsConfig(PreTrainedConfig):
 
     audio_token_id: int = 24
     begin_audio_token_id: int = 25
-    condition_dropped_token_id: int = 42
     num_codebooks: int = 37
     semantic_codebook_size: int = 8192
     acoustic_codebook_size: int = 21
     n_acoustic_codebook: int = 36
     audio_vocab_size: int = 9088
+    num_special_audio_tokens: int = 2
+    empty_audio_token_id: int = 0
+    end_audio_token_id: int = 1
+    num_flow_steps: int = 8
+    guidance_scale: float = 1.2
     sampling_rate: int = 24000
     frame_rate: float = 12.5
 

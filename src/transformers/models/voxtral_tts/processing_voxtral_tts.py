@@ -12,11 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 
 from ...feature_extraction_utils import BatchFeature
 from ...processing_utils import ProcessorMixin
-from ...utils import auto_docstring, is_soundfile_available, is_torch_available, logging
+from ...utils import (
+    auto_docstring,
+    is_mistral_common_available,
+    is_soundfile_available,
+    is_torch_available,
+    logging,
+    requires_backends,
+)
 from ...utils.hub import cached_file
 from ..auto import AutoTokenizer
 
@@ -30,7 +38,18 @@ if is_torch_available():
 if is_soundfile_available():
     import soundfile as sf
 
+if is_mistral_common_available():
+    from mistral_common.protocol.speech.request import SpeechRequest
 
+    from ...tokenization_mistral_common import MistralCommonBackend
+
+
+# Fallback id for the audio placeholder token, used only when the tokenizer does not expose its
+# audio encoder. Matches `audio_model_args.audio_token_id` in the checkpoint's params.json.
+DEFAULT_AUDIO_TOKEN_ID = 24
+
+# Fallback preset list. `from_pretrained` prefers the `voice:` mapping in the checkpoint's
+# params.json, which is authoritative; this covers checkpoints that do not ship one.
 KNOWN_VOICE_PRESETS = [
     "ar_male",
     "casual_female",
@@ -95,10 +114,20 @@ class VoxtralTtsProcessor(ProcessorMixin):
                 Additional keyword arguments passed to the tokenizer's `from_pretrained` method.
         """
         token = kwargs.get("token")
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        # The released checkpoint ships `tekken.json` but no `tokenizer_config.json`, so
+        # `AutoTokenizer` cannot infer `model_type` and would fall back to a plain tokenizers
+        # backend -- which has no speech-request API. Ask for the mistral-common backend directly.
+        if is_mistral_common_available():
+            tokenizer = MistralCommonBackend.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        else:
+            logger.warning(
+                "`mistral_common` is not installed, so prompts cannot be built for Voxtral TTS. "
+                "Install it with `pip install mistral-common`."
+            )
+            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
         voice_presets = {"repo_or_path": pretrained_model_name_or_path}
-        for name in KNOWN_VOICE_PRESETS:
+        for name in cls._candidate_voice_names(pretrained_model_name_or_path, token=token):
             rel_path = f"{cls.VOICE_PRESET_DIR}/{name}.pt"
             resolved = cached_file(
                 pretrained_model_name_or_path,
@@ -118,6 +147,28 @@ class VoxtralTtsProcessor(ProcessorMixin):
             )
 
         return cls(tokenizer=tokenizer, voice_presets=voice_presets)
+
+    @staticmethod
+    def _candidate_voice_names(pretrained_model_name_or_path, token=None) -> list[str]:
+        """Voice names from the checkpoint's `params.json`, falling back to the known list."""
+        params_path = cached_file(
+            pretrained_model_name_or_path,
+            "params.json",
+            token=token,
+            _raise_exceptions_for_gated_repo=False,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+        )
+        if params_path is not None:
+            try:
+                with open(params_path) as handle:
+                    params = json.load(handle)
+                voices = params["multimodal"]["audio_tokenizer_args"]["voice"]
+                if voices:
+                    return sorted(voices)
+            except (KeyError, TypeError, ValueError, OSError):
+                logger.warning("Could not read the voice list from params.json; using the built-in list.")
+        return KNOWN_VOICE_PRESETS
 
     def save_pretrained(self, save_directory, push_to_hub: bool = False, **kwargs):
         """
@@ -181,67 +232,99 @@ class VoxtralTtsProcessor(ProcessorMixin):
         """Returns a list of available voice preset names."""
         return [k for k in self.voice_presets if k != "repo_or_path"]
 
+    @property
+    def audio_token_id(self) -> int:
+        """Id of the audio placeholder token that reference-voice embeddings are scattered onto.
+
+        Taken from the tokenizer's audio encoder when it exposes one, which is authoritative; the
+        constant is the value shipped with `mistral_common` for this model family.
+        """
+        mistral_tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        encoder = getattr(mistral_tokenizer, "instruct", None) or getattr(
+            mistral_tokenizer, "instruct_tokenizer", None
+        )
+        audio_encoder = getattr(encoder, "audio_encoder", None)
+        special_ids = getattr(audio_encoder, "special_ids", None)
+        if special_ids is not None and getattr(special_ids, "audio", None) is not None:
+            return special_ids.audio
+        return DEFAULT_AUDIO_TOKEN_ID
+
+    def _speech_request_encoder(self):
+        """The `mistral_common` object carrying `encode_speech_request`.
+
+        `MistralCommonBackend` wraps a `MistralTokenizer`, which exposes the speech API as
+        `instruct_tokenizer`; vLLM-Omni spells the same thing `instruct`, so accept either.
+        """
+        requires_backends(self, ["mistral-common"])
+        mistral_tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        encoder = getattr(mistral_tokenizer, "instruct", None) or getattr(
+            mistral_tokenizer, "instruct_tokenizer", None
+        )
+        if encoder is None or not hasattr(encoder, "encode_speech_request"):
+            raise ValueError(
+                "The tokenizer does not expose `encode_speech_request`. Voxtral TTS needs a "
+                "`mistral_common` tokenizer new enough to support speech requests."
+            )
+        return encoder
+
     @auto_docstring
     def __call__(
         self,
         text=None,
         voice_preset=None,
         return_tensors="pt",
-        add_special_tokens=True,
         **kwargs,
     ) -> BatchFeature:
         r"""
-        text (`str` or `list[str]`):
-            The text to synthesize. Will be tokenized using the underlying tokenizer.
-        voice_preset (`str`, `torch.Tensor`, *optional*):
-            Voice preset to use for generation. Can be:
-            - A preset name (e.g. `"neutral_female"`)
-            - A path to a local `.pt` file containing audio codes
-            - A `torch.Tensor` of pre-computed audio codes
+        text (`str`):
+            The text to synthesize.
+        voice_preset (`str`, *optional*):
+            Name of a voice preset (e.g. `"neutral_female"`). The prompt layout depends on the
+            voice, because the reference-audio placeholder run is as long as that voice's embedding,
+            so the preset is resolved here rather than being an independent argument.
         return_tensors (`str`, *optional*, defaults to `"pt"`):
             The type of tensors to return.
-        add_special_tokens (`bool`, *optional*, defaults to `True`):
-            Whether to add special tokens when tokenizing the text.
-        **kwargs:
-            Additional keyword arguments passed to the tokenizer.
 
         Returns:
-            [`BatchFeature`]: A [`BatchFeature`] with the following fields:
-            - **input_ids** -- Token IDs for the input text.
-            - **attention_mask** -- Attention mask for the input text.
-            - **audio_codes** -- *(optional)* Voice reference audio codes of shape `(batch_size, num_frames,
-              num_codebooks)`. Only present when `voice_preset` is provided.
+            [`BatchFeature`] with:
+            - **input_ids** -- the full speech-request prompt, as produced by `mistral_common`:
+              `[BOS, begin_audio, audio x T, ..., text, ..., begin_audio]`.
+            - **voice_embeddings** -- *(optional)* `(T, hidden_size)` reference-voice embeddings,
+              one row per `audio_token_id` position in `input_ids`. These are **embeddings, not
+              codes**: the shipped presets are pre-computed activations, so they are scattered into
+              the prompt rather than looked up in the audio codebook table.
         """
         if text is None:
             raise ValueError("You must provide `text` to the VoxtralTtsProcessor.")
+        if isinstance(text, (list, tuple)):
+            raise ValueError(
+                "VoxtralTtsProcessor handles one prompt at a time; pass a single string. Batched "
+                "synthesis is not supported yet."
+            )
 
-        encoded = self.tokenizer(
-            text,
-            return_tensors=return_tensors,
-            add_special_tokens=add_special_tokens,
-            **kwargs,
+        encoder = self._speech_request_encoder()
+        request = (
+            SpeechRequest(input=text, voice=voice_preset) if voice_preset is not None else SpeechRequest(input=text)
         )
-        data = dict(encoded)
+        token_ids = list(encoder.encode_speech_request(request).tokens)
+
+        data = {"input_ids": [token_ids], "attention_mask": [[1] * len(token_ids)]}
 
         if voice_preset is not None:
-            if isinstance(voice_preset, str):
-                audio_codes = self._load_voice_preset(voice_preset, **kwargs)
-            elif is_torch_available() and isinstance(voice_preset, torch.Tensor):
-                audio_codes = voice_preset
-            else:
+            voice_embeddings = self._load_voice_preset(voice_preset, **kwargs)
+            if voice_embeddings.dim() != 2:
                 raise ValueError(
-                    f"Invalid voice_preset type: {type(voice_preset)}. "
-                    "Expected a string (preset name or path) or a torch.Tensor."
+                    f"Expected voice preset embeddings of shape (num_frames, hidden_size), got "
+                    f"{tuple(voice_embeddings.shape)}."
                 )
-
-            if audio_codes.dim() == 2:
-                audio_codes = audio_codes.unsqueeze(0)
-
-            batch_size = data["input_ids"].shape[0]
-            if audio_codes.shape[0] == 1 and batch_size > 1:
-                audio_codes = audio_codes.expand(batch_size, -1, -1)
-
-            data["audio_codes"] = audio_codes
+            num_placeholders = sum(1 for token in token_ids if token == self.audio_token_id)
+            if num_placeholders != voice_embeddings.shape[0]:
+                raise ValueError(
+                    f"Voice preset '{voice_preset}' has {voice_embeddings.shape[0]} frames but the "
+                    f"prompt reserves {num_placeholders} audio placeholders. The preset file and "
+                    "the tokenizer disagree about this voice."
+                )
+            data["voice_embeddings"] = voice_embeddings
 
         return BatchFeature(data=data, tensor_type=return_tensors)
 

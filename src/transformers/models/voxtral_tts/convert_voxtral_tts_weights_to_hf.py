@@ -96,7 +96,18 @@ def convert_config(original_config: dict) -> VoxtralTtsConfig:
     multimodal = original_config.pop("multimodal")
     audio_model_args = multimodal["audio_model_args"]
     audio_tokenizer_args = multimodal["audio_tokenizer_args"]
+    audio_encoding_args = audio_model_args.get("audio_encoding_args", {})
     fm_args = audio_model_args["acoustic_transformer_args"]
+
+    # `n_decoding_steps` is absent from the released params.json. The paper specifies 8 Euler steps;
+    # vLLM-Omni falls back to 7 when the key is missing. Pin it explicitly and say which was used.
+    num_flow_steps = fm_args.get("n_decoding_steps")
+    if num_flow_steps is None:
+        num_flow_steps = 8
+        print(
+            "`n_decoding_steps` not found in params.json; defaulting to 8 flow-matching steps "
+            "(the value stated in the paper). vLLM-Omni's fallback for this case is 7."
+        )
 
     flow_matching_config = VoxtralTtsFlowMatchingConfig(
         input_dim=fm_args["input_dim"],
@@ -106,11 +117,13 @@ def convert_config(original_config: dict) -> VoxtralTtsConfig:
         num_attention_heads=fm_args["n_heads"],
         num_key_value_heads=fm_args["n_kv_heads"],
         head_dim=fm_args["head_dim"],
-        rope_theta=fm_args.get("rope_theta", 10000.0),
+        rms_norm_eps=fm_args.get("norm_eps", 1e-5),
         sigma=fm_args.get("sigma", 1e-5),
         sigma_max=fm_args.get("sigma_max", 1.0),
         acoustic_dim=audio_model_args.get("n_acoustic_codebook", 36),
     )
+    # `acoustic_transformer_args.rope_theta` appears in params.json but the flow-matching
+    # transformer applies no rotary embedding, so it is deliberately not carried over.
 
     codec_config = VoxtralTtsCodecConfig(
         hidden_size=audio_tokenizer_args["dim"],
@@ -128,6 +141,9 @@ def convert_config(original_config: dict) -> VoxtralTtsConfig:
         conv_weight_norm=audio_tokenizer_args.get("conv_weight_norm", True),
         causal=audio_tokenizer_args.get("causal", True),
         qk_norm=audio_tokenizer_args.get("qk_norm", True),
+        use_biases=audio_tokenizer_args.get("use_biases", False),
+        attn_sliding_window_size=audio_tokenizer_args.get("attn_sliding_window_size", 16),
+        half_attn_window_upon_downsampling=audio_tokenizer_args.get("half_attn_window_upon_downsampling", True),
         qk_norm_eps=audio_tokenizer_args.get("qk_norm_eps", 1e-6),
         rms_norm_eps=audio_tokenizer_args.get("norm_eps", 0.01),
         layer_scale=audio_tokenizer_args.get("layer_scale", True),
@@ -154,13 +170,13 @@ def convert_config(original_config: dict) -> VoxtralTtsConfig:
         tie_word_embeddings=original_config.get("tied_embeddings", True),
         audio_token_id=audio_model_args.get("audio_token_id", 24),
         begin_audio_token_id=audio_model_args.get("begin_audio_token_id", 25),
-        condition_dropped_token_id=audio_model_args.get("condition_dropped_token_id", 42),
-        num_codebooks=audio_model_args.get("num_codebooks", 37),
+        num_codebooks=audio_encoding_args.get("num_codebooks", 37),
         semantic_codebook_size=audio_model_args.get("semantic_codebook_size", 8192),
         acoustic_codebook_size=audio_model_args.get("acoustic_codebook_size", 21),
         n_acoustic_codebook=audio_model_args.get("n_acoustic_codebook", 36),
-        sampling_rate=audio_model_args.get("sampling_rate", 24000),
-        frame_rate=audio_model_args.get("frame_rate", 12.5),
+        num_flow_steps=num_flow_steps,
+        sampling_rate=audio_encoding_args.get("sampling_rate", 24000),
+        frame_rate=audio_encoding_args.get("frame_rate", 12.5),
         codec_config=codec_config,
         flow_matching_config=flow_matching_config,
     )
@@ -174,7 +190,7 @@ def map_old_key_to_new(old_key: str) -> str:
         new_key, n_replace = re.subn(pattern, replacement, old_key)
         if n_replace > 0:
             return new_key
-    raise ValueError(f"Key: {old_key!r} could not be mapped (check STATE_DICT_MAPPING).")
+    return None
 
 
 def permute_for_rope(tensor: torch.Tensor, n_heads: int, dim1: int, dim2: int) -> torch.Tensor:
@@ -186,15 +202,24 @@ def convert_state_dict(original_state_dict: dict, config: VoxtralTtsConfig) -> d
     """Convert the original state dict to HF format with key remapping and Q/K permutation."""
     new_dict = {}
 
+    unmapped = []
     for old_key, tensor in original_state_dict.items():
         new_key = map_old_key_to_new(old_key)
+        if new_key is None:
+            unmapped.append(old_key)
+            continue
 
+        # Only the backbone uses rotary embeddings, so only its Q/K need the interleaved->split
+        # permutation. The flow-matching transformer has no RoPE; permuting it would corrupt it.
         if "backbone_model.layers" in new_key and "self_attn" in new_key:
             tensor = _permute_backbone_attn(tensor, new_key, config)
-        elif "flow_matching_transformer.layers" in new_key and "self_attn" in new_key:
-            tensor = _permute_fm_attn(tensor, new_key, config)
 
         new_dict[new_key] = tensor
+
+    if unmapped:
+        print(f"WARNING: {len(unmapped)} checkpoint keys had no mapping and were skipped:")
+        for key in unmapped:
+            print(f"    {key}")
 
     return new_dict
 
@@ -204,20 +229,6 @@ def _permute_backbone_attn(tensor: torch.Tensor, key: str, config: VoxtralTtsCon
     n_kv_heads = config.num_key_value_heads
     head_dim = config.head_dim
     hidden_size = config.hidden_size
-
-    if "q_proj" in key:
-        tensor = permute_for_rope(tensor, n_heads, n_heads * head_dim, hidden_size)
-    elif "k_proj" in key:
-        tensor = permute_for_rope(tensor, n_kv_heads, n_kv_heads * head_dim, hidden_size)
-    return tensor
-
-
-def _permute_fm_attn(tensor: torch.Tensor, key: str, config: VoxtralTtsConfig) -> torch.Tensor:
-    fm_config = config.flow_matching_config
-    n_heads = fm_config.num_attention_heads
-    n_kv_heads = fm_config.num_key_value_heads
-    head_dim = fm_config.head_dim
-    hidden_size = fm_config.hidden_size
 
     if "q_proj" in key:
         tensor = permute_for_rope(tensor, n_heads, n_heads * head_dim, hidden_size)
@@ -260,7 +271,7 @@ def write_model(
     model.tie_weights()
     print("Checkpoint loaded successfully.")
 
-    del model.config._name_or_path
+    model.config.__dict__.pop("_name_or_path", None)
     print("Saving the model.")
     model.save_pretrained(output_dir)
     del state_dict, model

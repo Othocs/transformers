@@ -29,7 +29,12 @@ Voxtral TTS is a hybrid architecture made of 3 main components:
 
 - **AR Backbone** (~3.4B params): A causal autoregressive decoder-only transformer (Ministral-3B-based) that takes tokenized text and optional voice reference audio codes as input, and predicts semantic audio tokens.
 - **Flow-Matching Transformer** (~390M params): A 3-layer bidirectional transformer that predicts acoustic tokens via flow matching. It takes the backbone hidden states, a timestep embedding, and current noisy acoustic embeddings as input, and uses an Euler ODE solver to produce acoustic token predictions.
-- **Voxtral Codec** (~150M params): A convolutional-transformer decoder that converts semantic + acoustic tokens into a 24kHz mono waveform. Only decoder weights are shipped (voice reference uses pre-computed embeddings).
+- **Voxtral Codec** (~150M params): A convolutional-transformer decoder that converts semantic + acoustic tokens into a 24kHz mono waveform. Only decoder weights are shipped, so a voice reference cannot be encoded from a waveform; the model ships 20 pre-computed voice embeddings instead.
+
+The processor builds the prompt through `mistral_common`, which lays it out as the model was trained:
+the reference voice first (as a run of audio placeholder tokens), then the text, then a marker that
+starts audio generation. The voice preset is a `(num_frames, hidden_size)` tensor of **embeddings**,
+scattered onto those placeholder positions -- it is not a tensor of codes.
 
 The model supports 9 languages: English, French, Spanish, German, Italian, Portuguese, Dutch, Arabic, and Hindi. It includes 20 preset voice embeddings for zero-shot voice cloning.
 
@@ -65,17 +70,26 @@ Voxtral TTS supports multilingual synthesis with language-specific voice presets
 
 ### Generation parameters
 
-The generation process supports several parameters to control audio quality:
-
 ```python
 >>> output = model.generate(
 ...     **inputs,
-...     max_new_tokens=500,    # max audio frames (at 12.5Hz frame rate)
-...     temperature=0.7,       # sampling temperature for semantic tokens
-...     top_k=50,              # top-k sampling
-...     n_nfe=8,               # number of Euler ODE steps for flow matching
-...     cfg_alpha=1.2,         # classifier-free guidance scale
+...     max_new_tokens=500,    # frame budget, at a 12.5 Hz frame rate
+...     num_flow_steps=8,      # Euler steps for the flow-matching ODE
+...     guidance_scale=1.2,    # classifier-free guidance on the acoustic velocity
 ... )
+```
+
+Generation stops on its own when the semantic codebook predicts `[END_AUDIO]`, so `max_new_tokens`
+is an upper bound rather than the length that will be produced.
+
+Semantic tokens are chosen greedily -- there is no temperature or top-k -- so the only stochastic
+part of the pipeline is the flow-matching noise. Pass a `generator` to make a run reproducible:
+
+```python
+>>> import torch
+
+>>> generator = torch.Generator(device=model.device).manual_seed(0)
+>>> output = model.generate(**inputs, generator=generator)
 ```
 
 ## VoxtralTtsConfig

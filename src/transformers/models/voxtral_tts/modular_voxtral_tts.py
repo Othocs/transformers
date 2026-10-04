@@ -27,6 +27,7 @@ from ..mistral.modeling_mistral import (
     MistralPreTrainedModel,
     MistralRMSNorm,
     MistralRotaryEmbedding,
+    repeat_kv,
 )
 from .configuration_voxtral_tts import VoxtralTtsCodecConfig, VoxtralTtsConfig, VoxtralTtsFlowMatchingConfig
 from .generation_voxtral_tts import VoxtralTtsGenerationMixin
@@ -62,18 +63,24 @@ class VoxtralTtsAudioEmbeddings(nn.Module):
         self._acoustic_codebook_size = config.acoustic_codebook_size
         self._n_acoustic_codebook = config.n_acoustic_codebook
         self._audio_vocab_size = config.audio_vocab_size
+        self._num_special_audio_tokens = config.num_special_audio_tokens
 
     def _get_offsets(self, device: torch.device) -> torch.LongTensor:
-        offsets = torch.zeros(self.num_codebooks, dtype=torch.long, device=device)
-        if self._n_acoustic_codebook > 1:
-            acoustic_stride = (
-                self._audio_vocab_size - self._semantic_codebook_size - self._acoustic_codebook_size
-            ) // (self._n_acoustic_codebook - 1)
-        else:
-            acoustic_stride = self._acoustic_codebook_size
-        for i in range(self._n_acoustic_codebook):
-            offsets[i + 1] = self._semantic_codebook_size + i * acoustic_stride
-        return offsets
+        """Row at which each codebook's block starts inside the shared embedding table.
+
+        Every codebook reserves `num_special_audio_tokens` rows below its own entries, so the
+        blocks are `semantic_codebook_size + num_special` followed by `n_acoustic_codebook` blocks
+        of `acoustic_codebook_size + num_special`. `audio_vocab_size` pads that total up to a
+        multiple of 128; the padding trails the last block and belongs to no codebook.
+        """
+        sizes = torch.full(
+            (self.num_codebooks,),
+            self._acoustic_codebook_size + self._num_special_audio_tokens,
+            dtype=torch.long,
+            device=device,
+        )
+        sizes[0] = self._semantic_codebook_size + self._num_special_audio_tokens
+        return torch.cumsum(sizes, dim=0) - sizes
 
     def forward(self, input_ids):
         offsets = self._get_offsets(input_ids.device)
@@ -83,7 +90,34 @@ class VoxtralTtsAudioEmbeddings(nn.Module):
 
 
 class VoxtralTtsPreTrainedModel(MistralPreTrainedModel):
-    pass
+    _no_split_modules = [
+        "VoxtralTtsDecoderLayer",
+        "VoxtralTtsFlowMatchingDecoderLayer",
+        "VoxtralTtsCodecTransformerLayer",
+    ]
+
+    def _init_weights(self, module):
+        """Defer entirely to Mistral's initialiser.
+
+        This hook runs *after* `from_pretrained` materialises the checkpoint, so anything it writes
+        overwrites trained values that loaded correctly. It must therefore never touch state the
+        checkpoint supplies. The two tempting candidates are both handled in `__init__` instead, and
+        both are recorded below because initialising them here silently destroyed the model twice.
+        """
+        super()._init_weights(module)
+
+        # `VoxtralTtsCodecTransformerLayer`'s layer-scale vectors are deliberately NOT initialised
+        # here either. They are trained parameters present in the checkpoint, and this hook runs
+        # after materialisation -- filling them with `layer_scale_init` replaced every trained
+        # value with the constant 0.01, which drives each transformer block's residual branch to
+        # nearly zero and collapses the codec decoder onto its convolution stack. Their `__init__`
+        # already seeds them with `layer_scale_init` for randomly initialised models.
+
+        # `VoxtralTtsSemanticCodebook`'s `cluster_usage` / `embedding_sum` are deliberately NOT
+        # touched here. They are persistent buffers carrying the trained VQ centroids, and this hook
+        # runs after the checkpoint is materialised -- initialising them replaces the codebook with
+        # noise, silently, in every `from_pretrained` model. Their `__init__` defaults (ones/zeros)
+        # already give a finite state for randomly initialised models.
 
 
 class VoxtralTtsBackboneModel(MistralModel):
@@ -92,19 +126,74 @@ class VoxtralTtsBackboneModel(MistralModel):
         self.embed_tokens = VoxtralTtsAudioEmbeddings(config)
 
 
-class VoxtralTtsFlowMatchingAttention(VoxtralTtsAttention):
-    def __init__(self, config, layer_idx: int):
-        super().__init__(config, layer_idx)
+class VoxtralTtsFlowMatchingAttention(nn.Module):
+    """Bidirectional attention over the flow-matching transformer's three input tokens.
+
+    The sequence is `[noisy acoustic sample, timestep, backbone hidden state]`. These are three
+    heterogeneous conditioning signals rather than a temporal sequence, so no positional embedding
+    is applied (the model uses sinusoidal encoding for the timestep *value* instead) and attention
+    is unmasked.
+    """
+
+    def __init__(self, config: VoxtralTtsFlowMatchingConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = config.head_dim
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
         self.is_causal = False
 
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
 
-class VoxtralTtsFlowMatchingDecoderLayer(VoxtralTtsDecoderLayer):
-    def __init__(self, config, layer_idx: int):
-        super().__init__(config, layer_idx)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len = hidden_states.shape[:2]
+        hidden_shape = (batch_size, seq_len, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_output = nn.functional.scaled_dot_product_attention(
+            query_states, key_states, value_states, attn_mask=None, scale=self.scaling
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return self.o_proj(attn_output)
+
+
+class VoxtralTtsFlowMatchingDecoderLayer(nn.Module):
+    def __init__(self, config: VoxtralTtsFlowMatchingConfig, layer_idx: int):
+        super().__init__()
         self.self_attn = VoxtralTtsFlowMatchingAttention(config=config, layer_idx=layer_idx)
+        self.mlp = VoxtralTtsMLP(config)
+        self.input_layernorm = VoxtralTtsRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = VoxtralTtsRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states + self.self_attn(self.input_layernorm(hidden_states))
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states
 
 
 class VoxtralTtsFlowMatchingTransformer(nn.Module):
+    """Predicts the acoustic velocity field for one audio frame.
+
+    Each call forms a three-token sequence from separately projected inputs -- the noisy acoustic
+    sample, the timestep embedding, and the backbone hidden state -- runs bidirectional attention
+    over it, and reads the velocity off the sample's position. The separate projections exist
+    because the three inputs differ in activation scale.
+
+    `semantic_codebook_output` lives here to mirror the checkpoint layout, but it is *not* part of
+    this forward pass: the semantic codebook is predicted directly from the backbone hidden state
+    via [`~VoxtralTtsFlowMatchingTransformer.predict_semantic_logits`].
+    """
+
     def __init__(self, config: VoxtralTtsFlowMatchingConfig):
         super().__init__()
         self.config = config
@@ -117,51 +206,76 @@ class VoxtralTtsFlowMatchingTransformer(nn.Module):
             [VoxtralTtsFlowMatchingDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = VoxtralTtsRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = VoxtralTtsRotaryEmbedding(config=config)
 
         self.semantic_codebook_output = nn.Linear(config.hidden_size, config.semantic_vocab_size, bias=False)
         self.acoustic_codebook_output = nn.Linear(config.hidden_size, config.acoustic_dim, bias=False)
 
-    @staticmethod
-    def _get_timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
-        half_dim = dim // 2
-        exponent = -math.log(10000.0) * torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) / half_dim
-        emb = timesteps.float().unsqueeze(-1) * torch.exp(exponent).unsqueeze(0)
-        return torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    def _inv_freq(self, device: torch.device) -> torch.Tensor:
+        """Inverse frequencies of the timestep embedding.
+
+        Computed on demand rather than held in a buffer. A non-persistent buffer is absent from the
+        checkpoint, so `from_pretrained` -- which builds the model on the meta device and then
+        materialises it from the checkpoint -- would leave it pointing at uninitialised memory. That
+        failure is near-silent: the embedding degenerates to `cos(0) = 1` for every timestep, so the
+        flow-matching ODE loses its time conditioning while still producing plausible-looking output.
+        """
+        half_dim = self.config.hidden_size // 2
+        exponent = torch.arange(half_dim, dtype=torch.float32, device=device) / half_dim
+        return torch.exp(-math.log(self.config.time_embedding_theta) * exponent)
+
+    def get_timestep_embedding(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """Sinusoidal embedding of `timesteps`, shape `(batch_size,)` -> `(batch_size, hidden_size)`."""
+        freqs = timesteps.float().unsqueeze(-1) * self._inv_freq(timesteps.device).unsqueeze(0)
+        return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
+
+    def predict_semantic_logits(self, backbone_hidden: torch.Tensor) -> torch.Tensor:
+        """Semantic codebook logits, read directly off the backbone hidden state."""
+        return self.semantic_codebook_output(backbone_hidden)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         timesteps: torch.Tensor,
         acoustic_embeddings: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.llm_projection(hidden_states)
-        timestep_embedding = self._get_timestep_embedding(timesteps, self.config.hidden_size).to(hidden_states.dtype)
-        t = self.time_projection(timestep_embedding)
-        x = self.input_projection(acoustic_embeddings)
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states (`torch.Tensor` of shape `(batch_size, input_dim)`):
+                Backbone hidden state for the frame being generated.
+            timesteps (`torch.Tensor` of shape `(batch_size,)`):
+                Current ODE time in `[0, 1]`.
+            acoustic_embeddings (`torch.Tensor` of shape `(batch_size, acoustic_dim)`):
+                Current noisy acoustic sample `x_t`.
 
-        combined = h + t.unsqueeze(1) + x
+        Returns:
+            `torch.Tensor` of shape `(batch_size, acoustic_dim)`: the velocity `v_t`.
+        """
+        timestep_embedding = self.get_timestep_embedding(timesteps).to(hidden_states.dtype)
 
-        position_ids = torch.arange(combined.shape[1], device=combined.device).unsqueeze(0)
-        position_embeddings = self.rotary_emb(combined, position_ids=position_ids)
+        sequence = torch.stack(
+            [
+                self.input_projection(acoustic_embeddings),
+                self.time_projection(timestep_embedding),
+                self.llm_projection(hidden_states),
+            ],
+            dim=1,
+        )
 
         for layer in self.layers:
-            combined = layer(
-                combined,
-                position_embeddings=position_embeddings,
-            )
+            sequence = layer(sequence)
 
-        combined = self.norm(combined)
-
-        semantic_logits = self.semantic_codebook_output(combined)
-        acoustic_output = self.acoustic_codebook_output(combined)
-        return semantic_logits, acoustic_output
+        sequence = self.norm(sequence)
+        return self.acoustic_codebook_output(sequence[:, 0, :])
 
 
 # ==================== Codec Components ====================
 
 
 class VoxtralTtsSemanticCodebook(nn.Module):
+    """Euclidean VQ codebook, stored as running sums so the effective table is a ratio."""
+
+    epsilon: float = 1e-5
+
     def __init__(self, config: VoxtralTtsCodecConfig):
         super().__init__()
         self.register_buffer("cluster_usage", torch.ones(config.semantic_codebook_size))
@@ -169,7 +283,7 @@ class VoxtralTtsSemanticCodebook(nn.Module):
 
     @property
     def embeddings(self):
-        return self.embedding_sum / self.cluster_usage.unsqueeze(-1)
+        return self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon).unsqueeze(-1)
 
     def decode(self, indices: torch.LongTensor) -> torch.Tensor:
         return nn.functional.embedding(indices, self.embeddings)
@@ -179,28 +293,89 @@ class VoxtralTtsQuantizer(nn.Module):
     def __init__(self, config: VoxtralTtsCodecConfig):
         super().__init__()
         self.semantic_codebook = VoxtralTtsSemanticCodebook(config)
+        self.acoustic_codebook_size = config.acoustic_codebook_size
 
     def decode_semantic(self, indices: torch.LongTensor) -> torch.Tensor:
         return self.semantic_codebook.decode(indices)
 
+    def decode_acoustic(self, codes: torch.LongTensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """Map FSQ levels in `[0, acoustic_codebook_size - 1]` back onto `[-1, 1]`.
+
+        Inverse of the quantisation applied to the flow-matching output, so the decoder sees values
+        on the scale it was trained against rather than the raw continuous sample.
+        """
+        return codes.to(dtype) * (2.0 / (self.acoustic_codebook_size - 1)) - 1.0
+
+
+def build_alibi_slopes(num_heads: int) -> torch.Tensor:
+    """Per-head ALiBi slopes: a geometric sequence with ratio `2 ** (-8 / num_heads)`.
+
+    Head counts that are not powers of two fall back to interleaving the slopes of the next power
+    of two, following the original ALiBi formulation.
+    """
+
+    def geometric(n: int) -> torch.Tensor:
+        ratio = 2.0 ** (-8.0 / n)
+        return torch.tensor([ratio**i for i in range(n)], dtype=torch.float32)
+
+    if math.log2(num_heads).is_integer():
+        return geometric(num_heads)
+    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+    return torch.cat(
+        [geometric(closest_power_of_2), geometric(2 * closest_power_of_2)[::2][: num_heads - closest_power_of_2]]
+    )
+
 
 class VoxtralTtsCodecAttention(nn.Module):
-    def __init__(self, config: VoxtralTtsCodecConfig):
+    """Sliding-window causal attention with ALiBi position bias.
+
+    The codec carries no rotary or learned positional embedding; ALiBi is its only source of
+    position information. `sliding_window` is per-block: it tracks the resampling factor, so the
+    decoder widens it (2 -> 4 -> 8 -> 16) as it upsamples back towards the waveform.
+    """
+
+    def __init__(self, config: VoxtralTtsCodecConfig, sliding_window: int):
         super().__init__()
-        self.num_heads = config.num_attention_heads
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
         self.is_causal = config.causal
+        self.sliding_window = sliding_window
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, self.hidden_size, bias=config.use_biases)
 
         self.use_qk_norm = config.qk_norm
         if config.qk_norm:
-            self.q_norm = VoxtralTtsRMSNorm(self.num_heads * self.head_dim, eps=config.qk_norm_eps)
-            self.k_norm = VoxtralTtsRMSNorm(self.num_heads * self.head_dim, eps=config.qk_norm_eps)
+            self.q_norm = VoxtralTtsRMSNorm(self.num_attention_heads * self.head_dim, eps=config.qk_norm_eps)
+            self.k_norm = VoxtralTtsRMSNorm(self.num_key_value_heads * self.head_dim, eps=config.qk_norm_eps)
+
+    def _build_attention_bias(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """ALiBi bias combined with the causal and sliding-window masks, shape `(1, heads, q, kv)`.
+
+        The slopes are recomputed here rather than cached in a buffer. A non-persistent buffer is
+        absent from the checkpoint, so `from_pretrained` would leave it uninitialised and the codec
+        would decode against a garbage position bias -- the same near-silent failure the
+        flow-matching timestep embedding hit. There are only `num_attention_heads` of them, so
+        there is nothing to gain from caching.
+        """
+        positions = torch.arange(seq_len, device=device)
+        relative_position = positions.unsqueeze(0) - positions.unsqueeze(1)
+
+        alibi_slopes = build_alibi_slopes(self.num_attention_heads).to(device=device, dtype=dtype)
+        attn_bias = alibi_slopes.view(-1, 1, 1) * relative_position.to(dtype)
+
+        if self.is_causal:
+            attn_bias = attn_bias.masked_fill(relative_position.unsqueeze(0) > 0, torch.finfo(dtype).min)
+
+        window_right = 0 if self.is_causal else self.sliding_window
+        outside_window = (relative_position < -self.sliding_window) | (relative_position > window_right)
+        attn_bias = attn_bias.masked_fill(outside_window.unsqueeze(0), torch.finfo(dtype).min)
+        return attn_bias.unsqueeze(0)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -213,12 +388,16 @@ class VoxtralTtsCodecAttention(nn.Module):
             query_states = self.q_norm(query_states)
             key_states = self.k_norm(key_states)
 
-        query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(batch_size, seq_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_len, -1, self.head_dim).transpose(1, 2)
 
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_bias = self._build_attention_bias(seq_len, hidden_states.device, query_states.dtype)
         attn_output = nn.functional.scaled_dot_product_attention(
-            query_states, key_states, value_states, is_causal=self.is_causal
+            query_states, key_states, value_states, attn_mask=attn_bias
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
@@ -229,7 +408,7 @@ class VoxtralTtsCodecMLP(nn.Module):
     def __init__(self, config: VoxtralTtsCodecConfig):
         super().__init__()
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.use_biases)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -237,9 +416,9 @@ class VoxtralTtsCodecMLP(nn.Module):
 
 
 class VoxtralTtsCodecTransformerLayer(nn.Module):
-    def __init__(self, config: VoxtralTtsCodecConfig, layer_idx: int = 0):
+    def __init__(self, config: VoxtralTtsCodecConfig, sliding_window: int, layer_idx: int = 0):
         super().__init__()
-        self.self_attn = VoxtralTtsCodecAttention(config)
+        self.self_attn = VoxtralTtsCodecAttention(config, sliding_window=sliding_window)
         self.mlp = VoxtralTtsCodecMLP(config)
         self.input_layernorm = VoxtralTtsRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = VoxtralTtsRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -268,9 +447,14 @@ class VoxtralTtsCodecTransformerLayer(nn.Module):
 
 
 class VoxtralTtsCodecTransformerBlock(nn.Module):
-    def __init__(self, config: VoxtralTtsCodecConfig, num_layers: int):
+    def __init__(self, config: VoxtralTtsCodecConfig, num_layers: int, sliding_window: int):
         super().__init__()
-        self.layers = nn.ModuleList([VoxtralTtsCodecTransformerLayer(config, layer_idx=i) for i in range(num_layers)])
+        self.layers = nn.ModuleList(
+            [
+                VoxtralTtsCodecTransformerLayer(config, sliding_window=sliding_window, layer_idx=i)
+                for i in range(num_layers)
+            ]
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.transpose(1, 2)
@@ -288,10 +472,12 @@ class VoxtralTtsCodecConvBlock(nn.Module):
         stride: int = 1,
         causal: bool = True,
         use_weight_norm: bool = True,
+        pad_mode: str = "replicate",
     ):
         super().__init__()
         self.causal = causal
         self.is_transpose = stride > 1
+        self.pad_mode = pad_mode
 
         if self.is_transpose:
             self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride=stride, bias=False)
@@ -311,8 +497,8 @@ class VoxtralTtsCodecConvBlock(nn.Module):
             if self.trim_right > 0 and self.causal:
                 hidden_states = hidden_states[..., : -self.trim_right]
         else:
-            if self.causal and self.left_pad > 0:
-                hidden_states = nn.functional.pad(hidden_states, (self.left_pad, 0))
+            if self.left_pad > 0:
+                hidden_states = nn.functional.pad(hidden_states, (self.left_pad, 0), mode=self.pad_mode)
             hidden_states = self.conv(hidden_states)
         return hidden_states
 
@@ -325,6 +511,11 @@ class VoxtralTtsCodecModel(nn.Module):
 
         decoder_blocks = []
         in_channels = config.semantic_dim + config.acoustic_dim
+
+        # The attention window tracks the resampling factor. The encoder narrows it on the way down
+        # (16 -> 8 -> 4 -> 2), so the decoder starts at the narrow end and widens symmetrically.
+        total_upsampling = math.prod(config.decoder_conv_strides)
+        sliding_window = max(1, config.attn_sliding_window_size // total_upsampling)
 
         for kernel, stride, n_layers in zip(
             config.decoder_conv_kernels,
@@ -341,7 +532,9 @@ class VoxtralTtsCodecModel(nn.Module):
                     use_weight_norm=config.conv_weight_norm,
                 )
             )
-            decoder_blocks.append(VoxtralTtsCodecTransformerBlock(config, n_layers))
+            if stride > 1 and config.half_attn_window_upon_downsampling:
+                sliding_window *= stride
+            decoder_blocks.append(VoxtralTtsCodecTransformerBlock(config, n_layers, sliding_window=sliding_window))
             in_channels = config.hidden_size
 
         self.decoder_blocks = nn.ModuleList(decoder_blocks)
@@ -353,6 +546,7 @@ class VoxtralTtsCodecModel(nn.Module):
             stride=1,
             causal=config.causal,
             use_weight_norm=config.conv_weight_norm,
+            pad_mode="reflect",
         )
         self.patch_size = config.patch_size
         self.channels = config.channels
@@ -360,19 +554,22 @@ class VoxtralTtsCodecModel(nn.Module):
     def decode(
         self,
         semantic_token_ids: torch.LongTensor,
-        acoustic_values: torch.Tensor,
+        acoustic_codes: torch.LongTensor,
     ) -> torch.Tensor:
         """
-        Decode semantic codes and acoustic values to an audio waveform.
+        Decode one frame sequence into a waveform.
 
         Args:
-            semantic_token_ids: (batch, seq_len) long tensor of semantic VQ indices
-            acoustic_values: (batch, seq_len, acoustic_dim) float tensor of acoustic embeddings
+            semantic_token_ids (`torch.LongTensor` of shape `(batch_size, num_frames)`):
+                Semantic VQ indices, with the audio special-token offset already removed.
+            acoustic_codes (`torch.LongTensor` of shape `(batch_size, num_frames, acoustic_dim)`):
+                Discrete FSQ levels in `[0, acoustic_codebook_size - 1]`, offset already removed.
 
         Returns:
-            waveform: (batch, channels, num_samples) float tensor
+            `torch.Tensor` of shape `(batch_size, channels, num_samples)`: the waveform.
         """
         semantic_embeddings = self.quantizer.decode_semantic(semantic_token_ids)
+        acoustic_values = self.quantizer.decode_acoustic(acoustic_codes, dtype=semantic_embeddings.dtype)
         decoder_input = torch.cat([semantic_embeddings, acoustic_values], dim=-1)
 
         hidden_states = decoder_input.transpose(1, 2)
@@ -409,6 +606,35 @@ class VoxtralTtsForTextToSpeech(VoxtralTtsPreTrainedModel, VoxtralTtsGenerationM
 
     def get_input_embeddings(self):
         return self.embed_text_tokens
+
+    def get_placeholder_mask(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        voice_embeddings: torch.FloatTensor,
+    ) -> torch.Tensor:
+        """Mask selecting the reference-voice placeholder positions in `inputs_embeds`.
+
+        Mirrors the idiom used across the library's multimodal models, and checks that the number of
+        placeholders matches the number of voice embedding rows -- a mismatch means the prompt and
+        the preset disagree about the reference length, which would otherwise scatter silently.
+        """
+        if input_ids is None:
+            special_audio_mask = inputs_embeds == self.get_input_embeddings()(
+                torch.full((), self.config.audio_token_id, dtype=torch.long, device=inputs_embeds.device)
+            )
+            special_audio_mask = special_audio_mask.all(-1)
+        else:
+            special_audio_mask = input_ids == self.config.audio_token_id
+
+        n_audio_tokens = int(special_audio_mask.sum())
+        n_voice_frames = voice_embeddings.shape[-2]
+        if n_audio_tokens != n_voice_frames:
+            raise ValueError(
+                f"Voice embeddings do not match the prompt: {n_audio_tokens} audio placeholder "
+                f"tokens but {n_voice_frames} embedding frames."
+            )
+        return special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
 
     def set_input_embeddings(self, value):
         self.embed_text_tokens = value

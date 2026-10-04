@@ -64,7 +64,7 @@ class VoxtralTtsModelTester:
             "head_dim": 16,
             "hidden_act": "silu",
             "max_position_embeddings": 64,
-            "audio_vocab_size": 256,
+            "audio_vocab_size": 384,
             "semantic_codebook_size": 64,
             "acoustic_codebook_size": 5,
             "n_acoustic_codebook": 36,
@@ -79,10 +79,8 @@ class VoxtralTtsModelTester:
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "head_dim": 16,
-            "semantic_vocab_size": 64,
+            "semantic_vocab_size": 128,
             "acoustic_dim": 36,
-            "max_position_embeddings": 64,
-            "rope_theta": 10000.0,
             "sigma": 1e-5,
             "sigma_max": 1.0,
         },
@@ -99,9 +97,9 @@ class VoxtralTtsModelTester:
             "patch_size": 8,
             "patch_proj_kernel_size": 3,
             "decoder_transformer_lengths": [1, 1, 1, 1],
-            "decoder_convs_kernels": [3, 4, 4, 4],
-            "decoder_convs_strides": [1, 2, 2, 2],
-            "norm_eps": 0.01,
+            "decoder_conv_kernels": [3, 4, 4, 4],
+            "decoder_conv_strides": [1, 2, 2, 2],
+            "rms_norm_eps": 0.01,
             "qk_norm_eps": 1e-6,
             "layer_scale_init": 0.01,
         },
@@ -250,18 +248,6 @@ class VoxtralTtsModelTest(ModelTesterMixin, unittest.TestCase):
         pass
 
     @pytest.mark.skip(
-        reason="Voxtral TTS uses custom codec/FM modules with layer_scale params and VQ codebook buffers "
-        "that require custom _init_weights. The modular converter currently cannot add _init_weights "
-        "when the parent (Mistral) doesn't define one."
-    )
-    def test_can_init_all_missing_weights(self):
-        pass
-
-    @pytest.mark.skip(reason="Same as test_can_init_all_missing_weights: codec codebook buffers not in _init_weights.")
-    def test_init_weights_can_init_buffers(self):
-        pass
-
-    @pytest.mark.skip(
         reason="VoxtralTtsCodecConfig uses strict dataclass validation and layer_scale field type "
         "conflicts with the test's type coercion."
     )
@@ -283,8 +269,75 @@ class VoxtralTtsModelTest(ModelTesterMixin, unittest.TestCase):
     def test_tp_plan_matches_params(self):
         pass
 
+    def test_state_survives_from_pretrained(self):
+        """Everything the checkpoint supplies must survive the meta-device load path.
+
+        Two distinct failure modes live here, and this model has shipped three instances between
+        them:
+
+        1. a buffer computed in `__init__` is absent from the checkpoint, so `from_pretrained` --
+           which builds on the meta device and materialises from the checkpoint -- leaves it
+           pointing at uninitialised memory (the flow-matching `inv_freq`, the codec's ALiBi slopes);
+        2. `_init_weights` runs after materialisation and overwrites trained state with an
+           initialiser (the semantic VQ codebook's centroids, and the codec's layer-scale vectors).
+
+        Both are near-silent: the model loads, runs, and produces plausible-looking garbage. The
+        second is why this test perturbs state before saving -- comparing a fresh model against its
+        own reload cannot catch an initialiser that writes the *same* constant `__init__` does.
+        """
+        config = self.model_tester.get_config()
+        model = VoxtralTtsForTextToSpeech(config=config)
+        model.eval()
+
+        # Give every checkpointed tensor a distinctive value, so an initialiser that overwrites it
+        # after loading is visible as a mismatch rather than a coincidence.
+        checkpointed = set(model.state_dict())
+        generator = torch.Generator().manual_seed(0)
+        with torch.no_grad():
+            for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+                if name in checkpointed and tensor.is_floating_point():
+                    tensor.copy_(torch.rand(tensor.shape, generator=generator).to(tensor.dtype) + 0.5)
+
+        expected = {k: v.clone() for k, v in model.state_dict().items()}
+        fresh_buffers = {k: v.clone() for k, v in model.named_buffers()}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model.save_pretrained(tmpdir)
+            reloaded = VoxtralTtsForTextToSpeech.from_pretrained(tmpdir)
+
+        actual = reloaded.state_dict()
+        self.assertEqual(set(expected), set(actual), "checkpointed tensor set changed across save/load")
+        for name, want in expected.items():
+            torch.testing.assert_close(
+                actual[name],
+                want,
+                msg=lambda m, n=name: (
+                    f"'{n}' differs after from_pretrained: {m}\n"
+                    "Something is overwriting checkpoint state -- most likely `_init_weights`, "
+                    "which runs after materialisation and must never touch anything the "
+                    "checkpoint supplies."
+                ),
+            )
+
+        # Non-persistent buffers are absent from the checkpoint by design, so they must instead be
+        # reconstructed identically from the config rather than left uninitialised.
+        loaded_buffers = dict(reloaded.named_buffers())
+        self.assertEqual(set(fresh_buffers), set(loaded_buffers), "buffer set changed across save/load")
+        for name, want in fresh_buffers.items():
+            if name in checkpointed:
+                continue
+            got = loaded_buffers[name]
+            self.assertTrue(
+                torch.isfinite(got).all(),
+                f"non-persistent buffer '{name}' holds non-finite values after from_pretrained -- "
+                "it was computed in __init__ and never restored by the load path",
+            )
+            torch.testing.assert_close(
+                got, want, msg=lambda m, n=name: f"non-persistent buffer '{n}' differs: {m}"
+            )
+
     def test_generate_with_tiny_model(self):
-        """Test that the custom TTS generate method works with a tiny config."""
+        """The custom TTS generate loop runs end to end and returns per-sequence outputs."""
         config = self.model_tester.get_config()
         model = VoxtralTtsForTextToSpeech(config=config)
         model.to(torch_device)
@@ -293,14 +346,58 @@ class VoxtralTtsModelTest(ModelTesterMixin, unittest.TestCase):
         input_ids = ids_tensor([1, 5], config.vocab_size).to(torch_device)
 
         output = model.generate(input_ids=input_ids, max_new_tokens=2)
-        self.assertIsNotNone(output.audio)
         self.assertEqual(len(output.audio), 1)
-        self.assertEqual(output.semantic_tokens.shape[0], 1)
-        self.assertEqual(output.semantic_tokens.shape[1], 2)
-        self.assertEqual(output.acoustic_values.shape, (1, 2, 36))
+        self.assertEqual(len(output.audio_codes), 1)
+        self.assertEqual(output.audio_codes[0].shape[-1], config.num_codebooks)
+        self.assertLessEqual(output.audio_codes[0].shape[0], 2)
+
+    def test_generate_emitted_codes_are_in_range(self):
+        """Every emitted code must be addressable in its own codebook block.
+
+        The audio embedding table lays codebooks out contiguously, so an out-of-range code silently
+        reads a neighbouring codebook's rows instead of raising.
+        """
+        config = self.model_tester.get_config()
+        model = VoxtralTtsForTextToSpeech(config=config)
+        model.to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([1, 5], config.vocab_size).to(torch_device)
+        output = model.generate(input_ids=input_ids, max_new_tokens=3, output_audio=False)
+
+        codes = output.audio_codes[0]
+        offset = config.num_special_audio_tokens
+        self.assertTrue(bool((codes[:, 0] < config.semantic_codebook_size + offset).all()))
+        self.assertTrue(bool((codes[:, 1:] >= offset).all()))
+        self.assertTrue(bool((codes[:, 1:] < config.acoustic_codebook_size + offset).all()))
+        # The semantic codebook may never predict [EMPTY_AUDIO].
+        self.assertTrue(bool((codes[:, 0] != config.empty_audio_token_id).all()))
+
+    def test_generate_stops_at_end_audio(self):
+        """Predicting [END_AUDIO] terminates generation well before the frame budget."""
+        config = self.model_tester.get_config()
+        model = VoxtralTtsForTextToSpeech(config=config)
+        model.to(torch_device)
+        model.eval()
+
+        # Force the semantic head to always choose [END_AUDIO].
+        original = model.flow_matching_transformer.predict_semantic_logits
+
+        def always_end(backbone_hidden):
+            logits = original(backbone_hidden)
+            logits[:, config.end_audio_token_id] = 1.0
+            return logits
+
+        model.flow_matching_transformer.predict_semantic_logits = always_end
+
+        input_ids = ids_tensor([1, 5], config.vocab_size).to(torch_device)
+        output = model.generate(input_ids=input_ids, max_new_tokens=64, output_audio=False)
+
+        # The terminating frame is dropped, so nothing is emitted.
+        self.assertEqual(output.audio_codes[0].shape[0], 0)
 
     def test_generate_without_audio_output(self):
-        """Test generate with output_audio=False returns tokens but no waveform."""
+        """`output_audio=False` returns codes but skips the codec."""
         config = self.model_tester.get_config()
         model = VoxtralTtsForTextToSpeech(config=config)
         model.to(torch_device)
@@ -310,11 +407,11 @@ class VoxtralTtsModelTest(ModelTesterMixin, unittest.TestCase):
 
         output = model.generate(input_ids=input_ids, max_new_tokens=2, output_audio=False)
         self.assertIsNone(output.audio)
+        self.assertIsNotNone(output.audio_codes)
         self.assertIsNotNone(output.semantic_tokens)
-        self.assertIsNotNone(output.acoustic_values)
 
     def test_generate_with_voice_reference(self):
-        """Test generate with audio_codes (voice reference)."""
+        """Voice reference frames are accepted and prepended to the text."""
         config = self.model_tester.get_config()
         model = VoxtralTtsForTextToSpeech(config=config)
         model.to(torch_device)
@@ -329,11 +426,41 @@ class VoxtralTtsModelTest(ModelTesterMixin, unittest.TestCase):
         ).to(torch_device)
 
         output = model.generate(input_ids=input_ids, audio_codes=audio_codes, max_new_tokens=2)
-        self.assertIsNotNone(output.audio)
-        self.assertEqual(output.semantic_tokens.shape[1], 2)
+        self.assertEqual(len(output.audio), 1)
+
+    def test_generate_scatters_voice_embeddings(self):
+        """Voice presets are embeddings scattered onto placeholders, not codes looked up in a table."""
+        config = self.model_tester.get_config()
+        model = VoxtralTtsForTextToSpeech(config=config)
+        model.to(torch_device)
+        model.eval()
+
+        num_ref_frames = 4
+        input_ids = ids_tensor([1, 8], config.vocab_size).to(torch_device)
+        input_ids[0, 1 : 1 + num_ref_frames] = config.audio_token_id
+        voice_embeddings = torch.randn(num_ref_frames, config.hidden_size, device=torch_device)
+
+        output = model.generate(
+            input_ids=input_ids, voice_embeddings=voice_embeddings, max_new_tokens=2, output_audio=False
+        )
+        self.assertIsNotNone(output.audio_codes)
+
+    def test_voice_embeddings_length_must_match_placeholders(self):
+        """A preset of the wrong length must raise rather than scatter silently."""
+        config = self.model_tester.get_config()
+        model = VoxtralTtsForTextToSpeech(config=config)
+        model.to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([1, 8], config.vocab_size).to(torch_device)
+        input_ids[0, 1:4] = config.audio_token_id  # 3 placeholders
+        voice_embeddings = torch.randn(5, config.hidden_size, device=torch_device)  # 5 frames
+
+        with self.assertRaises(ValueError):
+            model.generate(input_ids=input_ids, voice_embeddings=voice_embeddings, max_new_tokens=1)
 
     def test_generate_with_cfg(self):
-        """Test generate with classifier-free guidance."""
+        """Classifier-free guidance runs the batched conditional/unconditional pass."""
         config = self.model_tester.get_config()
         model = VoxtralTtsForTextToSpeech(config=config)
         model.to(torch_device)
@@ -341,9 +468,41 @@ class VoxtralTtsModelTest(ModelTesterMixin, unittest.TestCase):
 
         input_ids = ids_tensor([1, 5], config.vocab_size).to(torch_device)
 
-        output = model.generate(input_ids=input_ids, max_new_tokens=2, cfg_alpha=1.2)
-        self.assertIsNotNone(output.audio)
-        self.assertEqual(output.semantic_tokens.shape[1], 2)
+        output = model.generate(input_ids=input_ids, max_new_tokens=2, guidance_scale=1.2)
+        self.assertEqual(len(output.audio), 1)
+
+    def test_generate_rejects_padded_batches(self):
+        """Padded batches are refused rather than silently generating from padding."""
+        config = self.model_tester.get_config()
+        model = VoxtralTtsForTextToSpeech(config=config)
+        model.to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 5], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones(2, 5, dtype=torch.long, device=torch_device)
+        attention_mask[0, :2] = 0
+
+        with self.assertRaises(NotImplementedError):
+            model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=2)
+
+    def test_semantic_head_reads_backbone_hidden_state(self):
+        """The semantic codebook is predicted from the backbone hidden state, not the ODE output.
+
+        Guards the wiring: `predict_semantic_logits` must be a function of the backbone hidden state
+        alone, independent of the flow-matching sample.
+        """
+        config = self.model_tester.get_config()
+        model = VoxtralTtsForTextToSpeech(config=config)
+        model.to(torch_device)
+        model.eval()
+
+        hidden = torch.randn(2, config.hidden_size, device=torch_device)
+        with torch.no_grad():
+            first = model.flow_matching_transformer.predict_semantic_logits(hidden)
+            second = model.flow_matching_transformer.predict_semantic_logits(hidden)
+
+        self.assertEqual(first.shape, (2, config.flow_matching_config.semantic_vocab_size))
+        torch.testing.assert_close(first, second)
 
 
 @require_torch_accelerator
@@ -428,54 +587,38 @@ class VoxtralTtsIntegrationTest(unittest.TestCase):
 
     @slow
     def test_generate_produces_audio(self):
-        """Test that generate produces deterministic semantic tokens and audio from converted weights."""
+        """Structural checks on a real generation.
+
+        The exact sample values are deliberately not asserted here. The expectations this test
+        previously carried were recorded from an implementation whose semantic head, acoustic
+        quantisation and codebook offsets were all wrong -- they encoded the bug rather than
+        detecting it. Numeric expectations must be regenerated against the reference implementation
+        (vLLM-Omni) before being reinstated; see the parity harness described in the porting notes.
+        """
         model = self._get_model()
 
         input_ids = torch.tensor([[1, 306, 4658, 278, 6593, 310]], device=torch_device)
         torch.manual_seed(0)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(0)
-        output = model.generate(input_ids=input_ids, max_new_tokens=5, top_k=1)
+        output = model.generate(input_ids=input_ids, max_new_tokens=5)
 
-        self.assertIsNotNone(output.audio)
         self.assertEqual(len(output.audio), 1)
-        self.assertGreater(output.audio[0].numel(), 0)
-        self.assertEqual(output.semantic_tokens.shape, (1, 5))
-        self.assertEqual(output.acoustic_values.shape, (1, 5, 36))
-        self.assertTrue(torch.equal(output.semantic_tokens.cpu(), torch.tensor([[5980, 5980, 5980, 5980, 5980]])))
+        self.assertEqual(len(output.audio_codes), 1)
 
-        expected_acoustic_tail = torch.tensor(
-            [-1.4766, 0.3071, -1.1709, -0.7568, 1.4160, -0.8506, 0.0724, 0.5459, -1.0312, 1.9434]
-        )
-        expected_audio = torch.tensor(
-            [
-                -5.4264e-04,
-                -1.4496e-03,
-                -2.5272e-03,
-                -3.3607e-03,
-                -3.4122e-03,
-                -2.7237e-03,
-                -1.7328e-03,
-                -8.9598e-04,
-                -2.3019e-04,
-                -5.0724e-05,
-                -5.0163e-04,
-                -1.3714e-03,
-                -2.2926e-03,
-                -2.4929e-03,
-                -2.2831e-03,
-                -2.1725e-03,
-                -2.4471e-03,
-                -3.1719e-03,
-                -3.6354e-03,
-                -3.8662e-03,
-            ]
-        )
+        codes = output.audio_codes[0]
+        config = model.config
+        offset = config.num_special_audio_tokens
+        self.assertEqual(codes.shape[-1], config.num_codebooks)
+        self.assertLessEqual(codes.shape[0], 5)
 
-        torch.testing.assert_close(
-            output.acoustic_values[0, -1, :10].float().cpu(),
-            expected_acoustic_tail,
-            rtol=1e-3,
-            atol=1e-3,
-        )
-        torch.testing.assert_close(output.audio[0][:20].float().cpu(), expected_audio, rtol=1e-3, atol=1e-4)
+        # Codes must address their own codebook block, and acoustic levels must span the FSQ range
+        # rather than collapsing onto {0, 1} the way unscaled rounding does.
+        self.assertTrue(bool((codes[:, 0] < config.semantic_codebook_size + offset).all()))
+        self.assertTrue(bool((codes[:, 1:] >= offset).all()))
+        self.assertTrue(bool((codes[:, 1:] < config.acoustic_codebook_size + offset).all()))
+
+        if codes.shape[0] > 0:
+            acoustic_levels = (codes[:, 1:] - offset).float()
+            self.assertGreater(acoustic_levels.max().item(), 1.0, "acoustic levels collapsed -- quantisation is wrong")
+            self.assertEqual(output.audio[0].numel(), codes.shape[0] * int(config.sampling_rate / config.frame_rate))

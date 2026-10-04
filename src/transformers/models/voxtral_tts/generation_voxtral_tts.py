@@ -15,7 +15,6 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
 
 from ...generation import GenerationMixin
 from ...utils import ModelOutput, logging
@@ -31,270 +30,266 @@ class VoxtralTtsGenerateOutput(ModelOutput):
 
     Args:
         audio (`list[torch.Tensor]`, *optional*):
-            Generated audio waveform tensors, one per batch entry. Each tensor has shape `(num_samples,)`.
-        semantic_tokens (`torch.LongTensor` of shape `(batch_size, num_frames)`, *optional*):
-            Generated semantic token IDs from the flow-matching transformer.
-        acoustic_values (`torch.Tensor` of shape `(batch_size, num_frames, acoustic_dim)`, *optional*):
-            Generated continuous acoustic values from the flow-matching ODE.
+            Generated waveforms, one per batch entry, each of shape `(num_samples,)`. Entries are
+            trimmed independently at their own `[END_AUDIO]` frame, so lengths differ.
+        audio_codes (`list[torch.LongTensor]`, *optional*):
+            Generated frames per batch entry, each of shape `(num_frames, num_codebooks)`. Codes
+            carry the audio special-token offset, matching what the backbone consumes.
+        semantic_tokens (`list[torch.LongTensor]`, *optional*):
+            Semantic codebook ids per batch entry, offset removed, so in
+            `[0, semantic_codebook_size)`.
     """
 
     audio: list[torch.Tensor] | None = None
-    semantic_tokens: torch.LongTensor | None = None
-    acoustic_values: torch.Tensor | None = None
+    audio_codes: list[torch.LongTensor] | None = None
+    semantic_tokens: list[torch.LongTensor] | None = None
 
 
 class VoxtralTtsGenerationMixin(GenerationMixin):
     """
-    Generation mixin for Voxtral TTS that orchestrates the 3-stage pipeline:
+    Generation for Voxtral TTS, which does not fit the standard `generate` loop: each step samples a
+    37-integer audio frame rather than a token id, produced by two modules and embedded through a
+    separate table. The pipeline per frame is:
 
-    1. **Autoregressive backbone**: Processes text + voice reference, produces hidden states with KV caching.
-    2. **Flow-matching ODE** (per frame): Uses backbone hidden states to solve an Euler ODE (default 8 steps),
-       producing semantic tokens and continuous acoustic values. Supports classifier-free guidance.
-    3. **Codec decode**: Converts semantic tokens + acoustic values into a 24kHz audio waveform.
+    1. **Backbone step** -- a causal decoder over text + voice-reference frames produces a hidden
+       state, with KV caching.
+    2. **Semantic codebook** -- a linear head reads the semantic id directly off that hidden state,
+       greedily. Predicting `[END_AUDIO]` terminates the sequence.
+    3. **Acoustic codebooks** -- a flow-matching ODE, conditioned on the same hidden state and
+       guided by classifier-free guidance against a zeroed condition, produces 36 continuous values
+       that are scalar-quantised to FSQ levels.
+    4. **Codec decode** -- semantic ids plus acoustic levels become a 24 kHz waveform.
     """
 
     @torch.no_grad()
     def generate(
         self,
         input_ids: torch.LongTensor | None = None,
+        voice_embeddings: torch.FloatTensor | None = None,
         audio_codes: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        max_new_tokens: int = 4000,
-        temperature: float = 0.8,
-        top_k: int | None = None,
-        top_p: float | None = None,
-        n_nfe: int = 8,
-        cfg_alpha: float = 1.0,
+        max_new_tokens: int = 2048,
+        num_flow_steps: int | None = None,
+        guidance_scale: float | None = None,
         output_audio: bool = True,
+        generator: torch.Generator | None = None,
         **kwargs,
     ) -> VoxtralTtsGenerateOutput:
         r"""
-        Generate audio waveform from text input and optional voice reference.
+        Generate speech from text and an optional voice reference.
 
         Args:
             input_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
-                Text token IDs. Should end with `begin_audio_token_id` to signal the start of audio generation.
+                Prompt token ids from [`VoxtralTtsProcessor`], containing a run of
+                `config.audio_token_id` placeholders for the reference voice.
+            voice_embeddings (`torch.FloatTensor` of shape `(num_ref_frames, hidden_size)`, *optional*):
+                Reference-voice embeddings, scattered onto the placeholder positions in `input_ids`.
+                The shipped voice presets are pre-computed embeddings rather than codes, so this --
+                not `audio_codes` -- is the working path for this checkpoint.
             audio_codes (`torch.LongTensor` of shape `(batch_size, num_ref_frames, num_codebooks)`, *optional*):
-                Voice reference audio codes from a preset voice embedding. Shape is `(B, T, 37)` where 37 =
-                1 semantic + 36 acoustic codebooks.
+                Reference frames as discrete codes, for references produced by a codec encoder. The
+                released checkpoint ships no encoder, so this path is unused in practice; prefer
+                `voice_embeddings`.
             attention_mask (`torch.Tensor`, *optional*):
-                Attention mask for the input sequence.
-            max_new_tokens (`int`, *optional*, defaults to 4000):
-                Maximum number of audio frames to generate. At 12.5 Hz frame rate, 4000 frames = 320 seconds.
-            temperature (`float`, *optional*, defaults to 0.8):
-                Sampling temperature for semantic token generation.
-            top_k (`int`, *optional*):
-                Top-k filtering for semantic token sampling.
-            top_p (`float`, *optional*):
-                Top-p (nucleus) filtering for semantic token sampling.
-            n_nfe (`int`, *optional*, defaults to 8):
-                Number of function evaluations (Euler steps) for the flow-matching ODE solver.
-            cfg_alpha (`float`, *optional*, defaults to 1.0):
-                Classifier-free guidance scale. Set to 1.0 to disable CFG, >1.0 to strengthen conditioning.
-                Common value is 1.2 as suggested in the paper.
+                Only all-ones masks are currently supported; padded batches raise.
+            max_new_tokens (`int`, *optional*, defaults to 2048):
+                Frame budget. At 12.5 Hz, 2048 frames is roughly 164 seconds. Generation usually
+                stops earlier, when the semantic codebook predicts `[END_AUDIO]`.
+            num_flow_steps (`int`, *optional*):
+                Euler steps for the flow-matching ODE. Defaults to `config.num_flow_steps`.
+            guidance_scale (`float`, *optional*):
+                Classifier-free guidance scale on the acoustic velocity. Defaults to
+                `config.guidance_scale`. `1.0` disables guidance.
             output_audio (`bool`, *optional*, defaults to `True`):
-                Whether to decode the generated tokens into an audio waveform via the codec model.
+                Whether to run the codec and return waveforms.
+            generator (`torch.Generator`, *optional*):
+                Generator for the flow-matching noise, the only stochastic part of the pipeline.
 
         Returns:
-            [`VoxtralTtsGenerateOutput`] containing the generated audio, semantic tokens, and acoustic values.
+            [`VoxtralTtsGenerateOutput`]
 
         Example:
         ```python
-        >>> import torch
-        >>> from transformers import AutoTokenizer, VoxtralTtsForTextToSpeech
+        >>> from transformers import VoxtralTtsProcessor, VoxtralTtsForTextToSpeech
 
+        >>> processor = VoxtralTtsProcessor.from_pretrained("mistralai/Voxtral-4B-TTS-2603")
         >>> model = VoxtralTtsForTextToSpeech.from_pretrained("mistralai/Voxtral-4B-TTS-2603")
-        >>> tokenizer = AutoTokenizer.from_pretrained("mistralai/Voxtral-4B-TTS-2603")
 
-        >>> input_ids = tokenizer("Hello, how are you?", return_tensors="pt").input_ids
-        >>> output = model.generate(input_ids=input_ids, max_new_tokens=100)
-        >>> audio = output.audio[0]  # first batch entry, shape (num_samples,)
+        >>> inputs = processor("Hello, my name is Voxtral!", voice_preset="neutral_female")
+        >>> output = model.generate(**inputs)
+        >>> processor.save_audio(output.audio[0], "output.wav")
         ```
         """
         config = self.config
-        batch_size = input_ids.shape[0] if input_ids is not None else audio_codes.shape[0]
-
-        # --- 1. Prepare initial embeddings ---
-        parts = []
-        if audio_codes is not None:
-            parts.append(self.backbone_model.embed_tokens(audio_codes))
-        if input_ids is not None:
-            parts.append(self.embed_text_tokens(input_ids))
-        if not parts:
+        if input_ids is None and audio_codes is None:
             raise ValueError("At least one of `input_ids` or `audio_codes` must be provided.")
-        inputs_embeds = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
-
-        # --- 2. Backbone prefill (conditioned) ---
-        backbone_outputs = self.backbone_model(
-            inputs_embeds=inputs_embeds,
-            use_cache=True,
-        )
-        past_key_values = backbone_outputs.past_key_values
-        backbone_hidden = backbone_outputs.last_hidden_state[:, -1:, :]
-
-        # --- 3. Prepare unconditional backbone for CFG ---
-        uncond_cache = None
-        uncond_hidden = None
-        use_cfg = cfg_alpha != 1.0 and input_ids is not None
-        if use_cfg:
-            uncond_text_ids = torch.full_like(input_ids, config.condition_dropped_token_id)
-            uncond_parts = []
-            if audio_codes is not None:
-                uncond_parts.append(self.backbone_model.embed_tokens(audio_codes))
-            uncond_parts.append(self.embed_text_tokens(uncond_text_ids))
-            uncond_embeds = torch.cat(uncond_parts, dim=1) if len(uncond_parts) > 1 else uncond_parts[0]
-            uncond_outputs = self.backbone_model(inputs_embeds=uncond_embeds, use_cache=True)
-            uncond_cache = uncond_outputs.past_key_values
-            uncond_hidden = uncond_outputs.last_hidden_state[:, -1:, :]
-
-        # --- 4. Generation loop ---
-        fm_config = config.flow_matching_config
-        acoustic_dim = fm_config.acoustic_dim
-        sigma = fm_config.sigma
-        sigma_max = fm_config.sigma_max
-
-        all_semantic_tokens = []
-        all_acoustic_values = []
-
-        for frame_idx in range(max_new_tokens):
-            # 4a. Run flow-matching ODE for this frame
-            semantic_token, acoustic_value = self._flow_matching_step(
-                backbone_hidden=backbone_hidden,
-                uncond_hidden=uncond_hidden,
-                n_nfe=n_nfe,
-                cfg_alpha=cfg_alpha if use_cfg else 1.0,
-                sigma=sigma,
-                sigma_max=sigma_max,
-                acoustic_dim=acoustic_dim,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
+        if voice_embeddings is not None and input_ids is None:
+            raise ValueError("`voice_embeddings` needs `input_ids` to carry the placeholder positions.")
+        if attention_mask is not None and not bool(attention_mask.all()):
+            raise NotImplementedError(
+                "Voxtral TTS generation does not yet support padded batches. Generate one sequence "
+                "at a time, or group inputs of equal length."
             )
 
-            all_semantic_tokens.append(semantic_token)
-            all_acoustic_values.append(acoustic_value)
+        num_flow_steps = num_flow_steps if num_flow_steps is not None else config.num_flow_steps
+        guidance_scale = guidance_scale if guidance_scale is not None else config.guidance_scale
 
-            # 4b. Create next backbone input from generated codes
-            clamped_semantic = torch.clamp(semantic_token, 0, config.semantic_codebook_size - 1)
-            acoustic_codes_discrete = torch.clamp(
-                torch.round(acoustic_value), 0, config.acoustic_codebook_size - 1
-            ).long()
-            frame_codes = torch.cat([clamped_semantic.unsqueeze(-1), acoustic_codes_discrete], dim=-1).unsqueeze(
-                1
-            )  # (B, 1, num_codebooks)
+        # The prompt already carries the reference-voice run as `audio_token_id` placeholders, so
+        # the embeddings are scattered into position rather than prepended.
+        if input_ids is not None:
+            inputs_embeds = self.embed_text_tokens(input_ids)
+            if voice_embeddings is not None:
+                voice_embeddings = voice_embeddings.to(inputs_embeds.device, inputs_embeds.dtype)
+                mask = self.get_placeholder_mask(input_ids, inputs_embeds, voice_embeddings)
+                inputs_embeds = inputs_embeds.masked_scatter(mask, voice_embeddings)
+            if audio_codes is not None:
+                inputs_embeds = torch.cat([self.backbone_model.embed_tokens(audio_codes), inputs_embeds], dim=1)
+        else:
+            inputs_embeds = self.backbone_model.embed_tokens(audio_codes)
 
-            frame_embeds = self.backbone_model.embed_tokens(frame_codes)
+        batch_size = inputs_embeds.shape[0]
+        device = inputs_embeds.device
 
-            # 4c. Backbone step with cache
-            backbone_outputs = self.backbone_model(
-                inputs_embeds=frame_embeds,
+        outputs = self.backbone_model(inputs_embeds=inputs_embeds, use_cache=True)
+        past_key_values = outputs.past_key_values
+        backbone_hidden = outputs.last_hidden_state[:, -1, :]
+
+        offset = config.num_special_audio_tokens
+        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
+        collected_frames = []
+
+        for _ in range(max_new_tokens):
+            semantic_code = self._sample_semantic_code(backbone_hidden)
+            acoustic_codes = self._sample_acoustic_codes(
+                backbone_hidden,
+                num_flow_steps=num_flow_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            )
+
+            # Once a sequence has ended, its acoustic codebooks carry [EMPTY_AUDIO]. The reference
+            # assigns the token *before* applying the special-token offset, so the stored code is
+            # `empty_audio_token_id + num_special_audio_tokens`, not the bare token id.
+            ended = semantic_code == config.end_audio_token_id
+            empty_audio_code = config.empty_audio_token_id + config.num_special_audio_tokens
+            acoustic_codes = torch.where(
+                ended.unsqueeze(-1),
+                torch.full_like(acoustic_codes, empty_audio_code),
+                acoustic_codes,
+            )
+
+            frame_codes = torch.cat([semantic_code.unsqueeze(-1), acoustic_codes], dim=-1)
+            collected_frames.append(frame_codes)
+
+            unfinished = unfinished & ~ended
+            if not bool(unfinished.any()):
+                break
+
+            outputs = self.backbone_model(
+                inputs_embeds=self.backbone_model.embed_tokens(frame_codes.unsqueeze(1)),
                 past_key_values=past_key_values,
                 use_cache=True,
             )
-            past_key_values = backbone_outputs.past_key_values
-            backbone_hidden = backbone_outputs.last_hidden_state
+            past_key_values = outputs.past_key_values
+            backbone_hidden = outputs.last_hidden_state[:, -1, :]
 
-            # 4d. Update unconditional backbone if using CFG
-            if use_cfg:
-                uncond_outputs = self.backbone_model(
-                    inputs_embeds=frame_embeds,
-                    past_key_values=uncond_cache,
-                    use_cache=True,
-                )
-                uncond_cache = uncond_outputs.past_key_values
-                uncond_hidden = uncond_outputs.last_hidden_state
+        if not collected_frames:
+            empty = torch.zeros(batch_size, 0, config.num_codebooks, dtype=torch.long, device=device)
+            return VoxtralTtsGenerateOutput(
+                audio=[torch.zeros(0, device=device)] * batch_size if output_audio else None,
+                audio_codes=list(empty.unbind(0)),
+                semantic_tokens=[frame[:, 0] for frame in empty.unbind(0)],
+            )
 
-        # --- 5. Stack results ---
-        semantic_tokens = torch.stack(all_semantic_tokens, dim=1)
-        acoustic_values = torch.stack(all_acoustic_values, dim=1)
+        all_frames = torch.stack(collected_frames, dim=1)
 
-        # --- 6. Codec decode ---
+        # Trim each sequence at its own [END_AUDIO] frame.
+        per_sequence_codes, per_sequence_semantic = [], []
+        for i in range(batch_size):
+            semantic = all_frames[i, :, 0]
+            end_positions = (semantic == config.end_audio_token_id).nonzero()
+            cutoff = int(end_positions[0]) if end_positions.numel() > 0 else all_frames.shape[1]
+            per_sequence_codes.append(all_frames[i, :cutoff])
+            per_sequence_semantic.append((all_frames[i, :cutoff, 0] - offset).clamp(min=0))
+
         audio = None
         if output_audio:
-            codec_semantic_tokens = torch.clamp(semantic_tokens, 0, config.semantic_codebook_size - 1)
-            waveform = self.codec_model.decode(codec_semantic_tokens, acoustic_values)
-            audio = [waveform[i, 0] for i in range(batch_size)]
+            audio = []
+            for codes, semantic in zip(per_sequence_codes, per_sequence_semantic):
+                if codes.shape[0] == 0:
+                    audio.append(torch.zeros(0, device=device))
+                    continue
+                acoustic = (codes[:, 1:] - offset).clamp(min=0)
+                waveform = self.codec_model.decode(semantic.unsqueeze(0), acoustic.unsqueeze(0))
+                audio.append(waveform[0, 0])
 
         return VoxtralTtsGenerateOutput(
             audio=audio,
-            semantic_tokens=semantic_tokens,
-            acoustic_values=acoustic_values,
+            audio_codes=per_sequence_codes,
+            semantic_tokens=per_sequence_semantic,
         )
 
-    def _flow_matching_step(
+    def _sample_semantic_code(self, backbone_hidden: torch.Tensor) -> torch.LongTensor:
+        """Greedy semantic codebook prediction straight off the backbone hidden state.
+
+        `[EMPTY_AUDIO]` is never a legal prediction, and the head's output is padded up to a
+        multiple of 128, so the padding tail is masked out too -- otherwise the argmax could land on
+        a row that was never trained.
+        """
+        config = self.config
+        logits = self.flow_matching_transformer.predict_semantic_logits(backbone_hidden).float()
+        logits[:, config.empty_audio_token_id] = float("-inf")
+        logits[:, config.num_special_audio_tokens + config.semantic_codebook_size :] = float("-inf")
+        return logits.argmax(dim=-1)
+
+    def _sample_acoustic_codes(
         self,
         backbone_hidden: torch.Tensor,
-        uncond_hidden: torch.Tensor | None = None,
-        n_nfe: int = 8,
-        cfg_alpha: float = 1.0,
-        sigma: float = 1e-5,
-        sigma_max: float = 1.0,
-        acoustic_dim: int = 36,
-        temperature: float = 0.8,
-        top_k: int | None = None,
-        top_p: float | None = None,
-    ) -> tuple[torch.LongTensor, torch.Tensor]:
-        """
-        Run one flow-matching Euler ODE solve to produce a single audio frame.
+        num_flow_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator | None = None,
+    ) -> torch.LongTensor:
+        """Integrate the flow-matching ODE for one frame and scalar-quantise the result.
 
-        Starting from Gaussian noise x_0 ~ N(0, I), integrates the velocity field predicted by the
-        flow-matching transformer over `n_nfe` Euler steps from t=sigma to t=sigma_max. Optionally
-        applies classifier-free guidance by blending conditioned and unconditioned velocities.
-
-        Returns the sampled semantic token ID and continuous acoustic values for one frame.
+        Conditional and unconditional velocities are evaluated in a single batched forward pass; the
+        unconditional branch is the same network given a zeroed hidden state.
         """
+        config = self.config
         batch_size = backbone_hidden.shape[0]
-        device = backbone_hidden.device
-        dtype = backbone_hidden.dtype
+        device, dtype = backbone_hidden.device, backbone_hidden.dtype
+        acoustic_dim = config.flow_matching_config.acoustic_dim
 
-        x_t = torch.randn(batch_size, 1, acoustic_dim, device=device, dtype=dtype)
-        dt = (sigma_max - sigma) / n_nfe
+        sample = torch.randn(batch_size, acoustic_dim, device=device, dtype=dtype, generator=generator)
+        # Built in fp32 then cast: step sizes such as 1/7 are not representable in bf16.
+        timesteps = torch.linspace(0, 1, num_flow_steps + 1, device=device, dtype=torch.float32).to(dtype)
 
-        semantic_logits = None
+        use_guidance = guidance_scale != 1.0
+        conditioning = (
+            torch.cat([backbone_hidden, torch.zeros_like(backbone_hidden)]) if use_guidance else backbone_hidden
+        )
 
-        for step in range(n_nfe):
-            t = sigma + (sigma_max - sigma) * step / n_nfe
-            t_tensor = torch.full((batch_size,), t, device=device, dtype=dtype)
+        for step in range(num_flow_steps):
+            dt = timesteps[step + 1] - timesteps[step]
+            t = timesteps[step].expand(batch_size)
 
-            sem_logits_cond, v_cond = self.flow_matching_transformer(
-                hidden_states=backbone_hidden,
-                timesteps=t_tensor,
-                acoustic_embeddings=x_t,
-            )
-
-            if cfg_alpha != 1.0 and uncond_hidden is not None:
-                sem_logits_uncond, v_uncond = self.flow_matching_transformer(
-                    hidden_states=uncond_hidden,
-                    timesteps=t_tensor,
-                    acoustic_embeddings=x_t,
+            if use_guidance:
+                velocity = self.flow_matching_transformer(
+                    hidden_states=conditioning,
+                    timesteps=torch.cat([t, t]),
+                    acoustic_embeddings=torch.cat([sample, sample]),
                 )
-                velocity = v_uncond + cfg_alpha * (v_cond - v_uncond)
-                semantic_logits = sem_logits_uncond + cfg_alpha * (sem_logits_cond - sem_logits_uncond)
+                cond, uncond = velocity[:batch_size], velocity[batch_size:]
+                velocity = guidance_scale * cond + (1.0 - guidance_scale) * uncond
             else:
-                velocity = v_cond
-                semantic_logits = sem_logits_cond
+                velocity = self.flow_matching_transformer(
+                    hidden_states=conditioning, timesteps=t, acoustic_embeddings=sample
+                )
 
-            x_t = x_t + dt * velocity
+            sample = sample + velocity * dt
 
-        # Sample semantic token from the final step's logits
-        sem_logits = semantic_logits[:, -1, :] / temperature
+        levels = config.acoustic_codebook_size
+        scaled = ((sample.clamp(-1.0, 1.0) + 1.0) / 2.0) * (levels - 1)
+        return scaled.round().long() + config.num_special_audio_tokens
 
-        if top_k is not None:
-            topk_values = torch.topk(sem_logits, top_k)[0]
-            sem_logits = sem_logits.masked_fill(sem_logits < topk_values[..., -1:], float("-inf"))
 
-        if top_p is not None:
-            sorted_logits, sorted_indices = torch.sort(sem_logits, descending=True)
-            cumulative_probs = torch.cumsum(nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = False
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            sem_logits = sem_logits.masked_fill(indices_to_remove, float("-inf"))
-
-        probs = nn.functional.softmax(sem_logits, dim=-1)
-        semantic_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-        acoustic_value = x_t.squeeze(1)
-
-        return semantic_token, acoustic_value
+__all__ = ["VoxtralTtsGenerateOutput", "VoxtralTtsGenerationMixin"]
